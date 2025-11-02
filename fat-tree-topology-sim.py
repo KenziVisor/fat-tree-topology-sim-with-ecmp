@@ -117,8 +117,8 @@ def draw_graph(g: nx.Graph, k:int) -> None:
         if size > 0:
             print(f"✅ File '{file_name}' exists and has size {size} bytes.")
             return
-    raise FileNotFoundError(f"❌ File '{file_name}' was not created.")
-
+    exit(-1)
+    
 
 if __name__ == "__main__":
     #I used chatGPT for the parser of parameter k
