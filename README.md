@@ -19,6 +19,7 @@ cd fat-tree-topology-sim
 python3 -m venv .venv
 source .venv/bin/activate
 pip install networkx matplotlib numpy
+
 ```
 ---
 
