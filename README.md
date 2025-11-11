@@ -10,7 +10,7 @@ Fat-Tree topologies are widely used in real data centers because they provide **
 
 ---
 
-\## ⚙️ Installation
+## ⚙️ Installation
 
 ```bash
 
