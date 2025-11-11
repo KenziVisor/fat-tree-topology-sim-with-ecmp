@@ -171,7 +171,7 @@ def sample_random_host_pairs(g: nx.Graph) -> List[Tuple[str, str]]:
     return pairs
 
 
-def compute_avg_shortest_path(g: nx.Graph, pairs: list[tuple[str, str]]):
+def compute_avg_shortest_path(g: nx.Graph, pairs: List[Tuple[str, str]]):
     """
     Compute average shortest path over all reachable pairs.
     """
@@ -189,7 +189,7 @@ def compute_avg_shortest_path(g: nx.Graph, pairs: list[tuple[str, str]]):
     return avg_len, connected_frac
 
 
-def run_random_test_and_plot(k: int, prob_values: list[float], trials: int = 10):
+def run_random_test_and_plot(k: int, prob_values: List[float], trials: int = 10):
     base = build_fat_tree(k)
 
     avg_lengths = []
