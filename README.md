@@ -101,5 +101,3 @@ This property explains their widespread use in real-world data centers.
 | `average lengths as a function of link failure probability k = X trials = Y.png` | Performance graph |
 
 ---
-
-End of README.
