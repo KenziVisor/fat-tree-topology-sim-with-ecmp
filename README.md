@@ -267,7 +267,6 @@ The imbalance is caused purely by **hash collisions**, not by insufficient netwo
 | File | Description |
 |-----|-------------|
 | `fat tree topology k equals X p equals 0.png` | Layered topology visualization |
-| `average lengths as a function of link failure probability k equals X trials equals Y.png` | Failure resilience graph |
 | `ecmp load visualization k=X scenario=A.png` | ECMP load visualization (uniform traffic) |
 | `ecmp load visualization k=X scenario=B.png` | ECMP load visualization (pod-to-pod traffic) |
 
