@@ -486,7 +486,7 @@ def draw_ecmp_graph(g: nx.Graph, k: int, loads: dict, scenario: str, stats: dict
     sm.set_array([])
     fig.colorbar(sm, ax=ax, label="ECMP Load")
 
-    plt.title(f"ECMP Load Visualization — Scenario {scenario}, Avg load: {stats["avg"]:.2f}, Max load: {stats["max"]:.2f}, Std load: {stats["std"]:.2f}")
+    plt.title(f"ECMP Load Visualization — Scenario {scenario}, Avg load: {stats['avg']:.2f}, Max load: {stats['max']:.2f}, Std load: {stats['std']:.2f}")
     plt.axis("off")
 
     # --- 6. Save ---
