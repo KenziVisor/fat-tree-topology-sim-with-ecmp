@@ -562,5 +562,4 @@ if __name__ == "__main__":
             print("Error: prob must be in [0,1].", file=sys.stderr)
             sys.exit(1)
         run_random_test_and_plot(k, [prob], trials)
-
-
+        
