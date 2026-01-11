@@ -1,12 +1,12 @@
-# Fat-Tree Topology Simulation & ECMP Experiment
+# Fat-Tree Routing Simulation: ECMP, e-ECMP, and Flowlet-Based Load Balancing
 
-This project builds and analyzes a **k-ary Fat-Tree data center network topology**.  
-It includes two complementary experiments:
+This project implements a Python-based simulator for studying routing behavior in fat-tree data center networks. 
+The simulator focuses on multipath routing mechanisms used in modern large-scale clusters, including Equal-Cost Multi-Path (ECMP), enhanced ECMP using multiple Queue Pairs (e-ECMP), and flowlet-based path reshuffling.
 
-1. **Resilience to random link failures**
-2. **ECMP (Equal-Cost Multi-Path) load balancing behavior**
+Rather than modeling packet-level transport or queuing, the simulator isolates routing decisions at the flow and flowlet level. 
+This allows direct examination of how different hashing-based routing schemes distribute traffic load across network links and mitigate congestion hotspots.
 
-Fat-Tree topologies are widely used in real data centers because they provide **multiple redundant paths**, improving **fault tolerance**, **throughput**, and **scalability**.
+The framework supports reproducible parameter sweeps over topology size, traffic load, number of QPs, and flowlet intervals, producing quantitative comparisons of routing efficiency and load balance.
 
 ---
 
@@ -24,35 +24,58 @@ Clone and set up the environment:
 
 ## Usage
 
-### 1️⃣ Draw the topology (no failures)
+### 1️⃣ Run Fat-Tree resilience experiment
 
-    python fat-tree-topology-sim.py -k 4
+    python3 fat-tree-topology-sim.py --experiment fat_tree -k 8 --sweep "0,0.05,0.1,0.2" --trials 10
 
-### 2️⃣ Draw the topology with random link failures
+This experiment evaluates network connectivity under random link failures.
 
-    python fat-tree-topology-sim.py -k 4 -p 0.1
+---
 
-### 3️⃣ Run failure-sweep performance experiment
+### 2️⃣ Run classic ECMP experiment (Scenario A + B)
 
-    python fat-tree-topology-sim.py -k 4 --sweep "0,0.1,0.2,0.3,0.5" -t 10
+    python3 fat-tree-topology-sim.py --experiment ecmp -k 8 --num_flows 2000
 
-### 4️⃣ Run ECMP load-balancing experiment
+This runs the static ECMP load-balancing experiment on two traffic scenarios.
 
-    python fat-tree-topology-sim.py -k 8 --ecmp 1
+---
 
-This runs a **static ECMP experiment** on a failure-free Fat-Tree topology and visualizes **per-link load imbalance**.
+### 3️⃣ Run RoCE routing experiment (ECMP vs e-ECMP vs Flowlet-e-ECMP)
+
+Basic single-point experiment:
+
+    python3 fat-tree-topology-sim.py --experiment roce -k 8 --num_flows 2000 --qps 8 --trials 20
+
+Sweep over QPs (effect of e-ECMP):
+
+    python3 fat-tree-topology-sim.py --experiment roce -k 8 --num_flows 2000 --qps_sweep 1,2,4,8,16 --trials 20
+
+Sweep over flowlets (effect of flowlet reshuffling):
+
+    python3 fat-tree-topology-sim.py --experiment roce -k 8 --num_flows 2000 --qps 8 --trials_sweep 1,2,5,10,20,40
+
+Sweep over topology size:
+
+    python3 fat-tree-topology-sim.py --experiment roce --k_sweep 4,8,16 --num_flows 2000 --qps 8 --trials 20
 
 ---
 
 ## Command-Line Arguments
 
-| Argument | Meaning | Example |
-|--------|--------|--------|
-| `-k` | Fat-tree size (must be a positive even number) | `-k 4` |
-| `-p` / `--prob` | Single link failure probability (0–1) | `-p 0.1` |
-| `--sweep` | Multiple probabilities to test | `--sweep "0,0.2,0.4"` |
-| `-t` / `--trials` | Number of averaging runs per probability | `-t 10` |
-| `--ecmp` | Run ECMP experiment (ignores failure parameters) | `--ecmp 1` |
+| Argument | Meaning |
+|----------|---------|
+| `--experiment` | Select experiment: `fat_tree`, `ecmp`, or `roce` |
+| `-k` | Fat-tree size (required unless using `--k_sweep` in RoCE) |
+| `--k_sweep` | Comma-separated k values for RoCE sweep |
+| `--num_flows` | Number of simulated flows (default: 2000) |
+| `--flow_load` | Load per flow (default: 1.0) |
+| `--qps` | Number of QPs per flow (for e-ECMP) |
+| `--qps_sweep` | Comma-separated QP values for RoCE sweep |
+| `--trials` | Number of flowlet time epochs |
+| `--trials_sweep` | Comma-separated trial values for RoCE sweep |
+| `--prob` | Link failure probability (fat_tree only) |
+| `--sweep` | Probability sweep for fat_tree experiment |
+| `--seed` | Random seed |
 
 ---
 
@@ -271,12 +294,76 @@ The imbalance is caused purely by **hash collisions**, not by insufficient netwo
 | `ecmp load visualization k=X scenario=B.png` | ECMP load visualization (pod-to-pod traffic) |
 
 ---
+## Experiment 3: RoCE Routing – ECMP, e-ECMP, and Flowlet-e-ECMP
+
+### Motivation
+
+Modern AI training clusters employ RDMA over Ethernet and rely on multi-path routing. 
+Recent systems extend ECMP by splitting flows across multiple Queue Pairs (e-ECMP) and further reshuffling paths over time using flowlets. 
+This experiment isolates and evaluates the **routing-level behavior** of these mechanisms.
+
+---
+
+### Routing Models
+
+**ECMP:**  
+Each flow is hashed once to a single equal-cost path.
+
+**e-ECMP:**  
+Each flow is split into multiple QPs, each hashed independently.
+
+**Flowlet-based e-ECMP:**  
+Each QP is periodically re-hashed across equal-cost paths at discrete flowlet intervals, enabling temporal path diversity while preserving in-order delivery within each flowlet.
+
+---
+
+### Traffic Model
+
+- Uniform random host-to-host flows
+- Equal normalized load per flow
+- No queuing or transport modeling — routing effects only
+
+---
+
+### Evaluation Metrics
+
+From per-link simulated loads:
+
+- **p99 link load** – congestion hotspot severity  
+- **CV (std/mean)** – global load balance fairness
+
+---
+
+### Output Visualization
+
+For each parameter sweep (topology size k, QPs per flow, or number of flowlets), two graphs are produced:
+
+- **p99(link load) vs sweep parameter**  
+- **CV(load) vs sweep parameter**
+
+Each graph compares three routing schemes:
+
+**ECMP**, **e-ECMP**, and **Flowlet-e-ECMP**
+
+---
+
+### Output Files
+
+Example filenames:
+
+- **roce_p99_vs_qps_k=8_trials=20.png**
+- **roce_cv_vs_qps_k=8_trials=20.png**
+- **roce_p99_vs_trials_k=8_qps=8.png**
+- **roce_cv_vs_k_qps=8_trials=20.png**
+
+These plots are directly used for analysis in the final report.
+
+---
 
 ## Summary
 
-This project demonstrates two complementary properties of Fat-Tree networks:
+This simulator provides a lightweight experimental framework for evaluating multipath routing strategies in fat-tree data center networks. 
+By comparing ECMP, e-ECMP, and flowlet-based e-ECMP under controlled traffic conditions, the project highlights the impact of increased path diversity and temporal reshuffling on load distribution.
 
-- **Structural robustness** to random failures
-- **Sensitivity of routing behavior** under static ECMP
+The resulting measurements and visualizations offer clear insight into how modern routing extensions reduce congestion hotspots and improve global load balance, complementing transport-level studies of data center networks.
 
-Together, they highlight why **topology alone is not enough**—routing algorithms matter just as much.
