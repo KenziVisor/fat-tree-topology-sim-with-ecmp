@@ -348,7 +348,7 @@ def compute_all_ecmp_paths(g, flows):
     return path_map
 
 
-def hash_and_route(g, flows, path_map):
+def hash_and_route(flows, path_map, flow_load=1, qps_num=1, timestamp=0):
     print("[ECMP] Hashing flows and assigning ECMP paths...")
 
     # link load map: (u, v) → load_value
@@ -358,19 +358,29 @@ def hash_and_route(g, flows, path_map):
         paths = path_map[(src, dst)]
         num_paths = len(paths)
 
-        # deterministic ECMP hash
-        h = (hash(src) * 1315423911 + hash(dst) * 2654435761) % num_paths
-        chosen_path = paths[h]
+        # each QP carries an equal share of the total flow load
+        subflow_load = flow_load / qps_num
 
-        # accumulate load on each directed link in the chosen path
-        for i in range(len(chosen_path) - 1):
-            u = chosen_path[i]
-            v = chosen_path[i + 1]
+        for qp_id in range(qps_num):
 
-            # store links as sorted tuples so (u, v) and (v, u) are treated consistently
-            link = tuple(sorted((u, v)))
+            # deterministic ECMP hash
+            # timestamp added to enable flowlet-based reshuffling
+            h = (hash(src) * 1315423911 +
+                 hash(dst) * 2654435761 +
+                 hash(qp_id) * 97531 +
+                 hash(timestamp) * 19260817) % num_paths
 
-            loads[link] = loads.get(link, 0) + 1
+            chosen_path = paths[h]
+
+            # accumulate load on each directed link in the chosen path
+            for i in range(len(chosen_path) - 1):
+                u = chosen_path[i]
+                v = chosen_path[i + 1]
+
+                # store links as sorted tuples so (u, v) and (v, u) are treated consistently
+                link = tuple(sorted((u, v)))
+
+                loads[link] = loads.get(link, 0) + subflow_load
 
     print("[ECMP] Flow assignment complete.\n")
     return loads
@@ -404,6 +414,90 @@ def compute_load_stats(loads):
     print(stats, "\n")
 
     return stats
+
+
+def node_type(n):
+    if str(n).startswith("core"):
+        return "core"
+    if str(n).startswith("agg"):
+        return "agg"
+    if str(n).startswith("edge"):
+        return "edge"
+    return "host"
+
+
+def compute_usage_metrics(g, loads):
+    """
+    Compute link-usage metrics for ECMP / e-ECMP / Flowlet-e-ECMP experiments.
+
+    Parameters
+    ----------
+    g : networkx.Graph
+        Fat-tree topology graph
+    loads : dict
+        {(u,v): load_value}
+
+    Returns
+    -------
+    metrics : dict containing:
+        p99              : global 99th percentile of link loads
+        cv               : coefficient of variation (std/mean)
+        util_frac        : fraction of links with load > 0
+        layer_p99       : dict with p99 per layer type
+                           keys: 'core-agg', 'agg-edge', 'edge-host'
+    """
+
+    # ---- collect all link loads ----
+    all_edges = [tuple(sorted(e)) for e in g.edges()]
+    load_values = np.array([loads.get(e, 0.0) for e in all_edges])
+
+    # ---- global metrics ----
+    mean = load_values.mean()
+    std = load_values.std()
+    cv = std / mean if mean > 0 else 0.0
+
+    p99 = np.percentile(load_values, 99)
+    util_frac = np.count_nonzero(load_values > 0) / len(load_values)
+
+    # ---- classify edges by fat-tree layer ----
+    # Node naming convention in your code:
+    # "core_x", "agg_pod_switch", "edge_pod_switch", "host_pod_x"
+    # We detect type by prefix.
+
+    layer_loads = {
+        "core-agg": [],
+        "agg-edge": [],
+        "edge-host": []
+    }
+
+    for (u, v), val in zip(all_edges, load_values):
+        t1 = node_type(u)
+        t2 = node_type(v)
+
+        if {t1, t2} == {"core", "agg"}:
+            layer_loads["core-agg"].append(val)
+        elif {t1, t2} == {"agg", "edge"}:
+            layer_loads["agg-edge"].append(val)
+        elif {t1, t2} == {"edge", "host"}:
+            layer_loads["edge-host"].append(val)
+
+    # ---- compute p99 per layer ----
+    layer_p99 = {}
+    for layer, vals in layer_loads.items():
+        if len(vals) == 0:
+            layer_p99[layer] = 0.0
+        else:
+            layer_p99[layer] = np.percentile(vals, 99)
+
+    # ---- pack results ----
+    metrics = {
+        "p99": float(p99),
+        "cv": float(cv),
+        "util_frac": float(util_frac),
+        "layer_p99": layer_p99
+    }
+
+    return metrics
 
 
 def draw_ecmp_graph(g: nx.Graph, k: int, loads: dict, scenario: str, stats: dict) -> None:
@@ -507,59 +601,517 @@ def run_ecmp_experiment(g: nx.Graph, num_flows=2000, scenario="A"):
     state = extract_topology_info(g)
     flows = generate_flows(state, num_flows, scenario)
     path_map = compute_all_ecmp_paths(g, flows)
-    loads = hash_and_route(g, flows, path_map)
+    loads = hash_and_route(flows, path_map)
     stats = compute_load_stats(loads)
     draw_ecmp_graph(g, k, loads, scenario, stats)
 
     print("=== ECMP EXPERIMENT END ===\n")
 
 
+def run_flowlet_roce_experiment(g: nx.Graph, num_flows=2000, scenario="A",
+                                flow_load=1.0, qps_num=1, trials=1):
+    print("\n=== FLOWLET RoCE EXPERIMENT START ===")
+
+    state = extract_topology_info(g)
+    flows = generate_flows(state, num_flows, scenario)
+    path_map = compute_all_ecmp_paths(g, flows)
+
+    # --- Accumulate loads across timesteps (flowlets) ---
+    total_loads = {}
+
+    for t in range(trials):
+        print(f"[ECMP] Timestep {t+1}/{trials}")
+
+        per_timestep_load = flow_load / trials
+
+        loads_t = hash_and_route(flows, path_map,
+                                 flow_load=per_timestep_load,
+                                 qps_num=qps_num,
+                                 timestamp=t)
+
+        # accumulate per-timestep loads
+        for link, val in loads_t.items():
+            total_loads[link] = total_loads.get(link, 0) + val
+
+    # --- Compute stats and draw ---
+    stats = compute_load_stats(total_loads)
+
+    if qps_num == 1 and trials == 1:
+        scenario_title = "ECMP"
+    elif qps_num > 1 and trials == 1:
+        scenario_title = "E-ECMP"
+    else:
+        scenario_title = "FLOWLET E-ECMP"
+    draw_ecmp_graph(g, k, total_loads, scenario=scenario_title, stats=stats)
+
+    print("=== FLOWLET RoCE EXPERIMENT END ===\n")
+
+
+def run_roce_sweep_summary(x_axis, sweep_values,
+                           k_fixed,
+                           qps_fixed,
+                           trials_fixed,
+                           num_flows,
+                           flow_load,
+                           seed=0):
+    """
+    Run RoCE sweep experiment and collect usage metrics.
+
+    Parameters
+    ----------
+    x_axis : str
+        Which parameter to sweep: "k", "qps", or "trials"
+    sweep_values : list
+        Values for the sweep axis
+    k_fixed : int
+        k value when not sweeping over k
+    qps_fixed : int
+        qps value when not sweeping over qps
+    trials_fixed : int
+        trials value when not sweeping over trials
+    num_flows : int
+    flow_load : float
+    seed : int
+
+    Returns
+    -------
+    results : dict
+        results[scheme][x_value] -> metrics dict
+        scheme ∈ {"ecmp", "eecmp", "flowlet"}
+    """
+
+    np.random.seed(seed)
+    random.seed(seed)
+
+    results = {
+        "ecmp": {},
+        "eecmp": {},
+        "flowlet": {}
+    }
+
+    for x in sweep_values:
+        print(f"\n===== RoCE sweep: {x_axis} = {x} =====")
+
+        # --- assign current parameters depending on sweep axis ---
+        if x_axis == "k":
+            k = x
+            qps = qps_fixed
+            trials = trials_fixed
+        elif x_axis == "qps":
+            k = k_fixed
+            qps = x
+            trials = trials_fixed
+        elif x_axis == "trials":
+            k = k_fixed
+            qps = qps_fixed
+            trials = x
+        else:
+            raise ValueError("x_axis must be 'k', 'qps', or 'trials'")
+
+        # --- build topology ---
+        g = build_fat_tree(k)
+
+        # --- prepare flows and ECMP path map once ---
+        state = extract_topology_info(g)
+        flows = generate_flows(state, num_flows, scenario="A")
+        path_map = compute_all_ecmp_paths(g, flows)
+
+        # =========================================================
+        # 1) ECMP baseline  (1 QP, 1 trial)
+        # =========================================================
+        loads_ecmp = hash_and_route(flows, path_map,
+                                    flow_load=flow_load,
+                                    qps_num=1,
+                                    timestamp=0)
+
+        metrics_ecmp = compute_usage_metrics(g, loads_ecmp)
+        results["ecmp"][x] = metrics_ecmp
+
+        # =========================================================
+        # 2) e-ECMP  (multi-QP, single trial)
+        # =========================================================
+        loads_eecmp = hash_and_route(flows, path_map,
+                                     flow_load=flow_load,
+                                     qps_num=qps,
+                                     timestamp=0)
+
+        metrics_eecmp = compute_usage_metrics(g, loads_eecmp)
+        results["eecmp"][x] = metrics_eecmp
+
+        # =========================================================
+        # 3) Flowlet-e-ECMP  (multi-QP, multi-trial)
+        # =========================================================
+
+        total_loads_flowlet = {}
+
+        per_timestep_load = flow_load / trials
+
+        for t in range(trials):
+            loads_t = hash_and_route(flows, path_map,
+                                     flow_load=per_timestep_load,
+                                     qps_num=qps,
+                                     timestamp=t)
+
+            for link, val in loads_t.items():
+                total_loads_flowlet[link] = total_loads_flowlet.get(link, 0) + val
+
+        metrics_flowlet = compute_usage_metrics(g, total_loads_flowlet)
+        results["flowlet"][x] = metrics_flowlet
+
+    return results
+
+
+def _extract_metric(results, schemes, x_values, metric_name, layer=None):
+    data = {}
+    for scheme in schemes:
+        vals = []
+        for x in x_values:
+            m = results[scheme][x]
+            if layer is None:
+                vals.append(m[metric_name])
+            else:
+                vals.append(m["layer_p99"][layer])
+        data[scheme] = vals
+    return data
+
+
+def _save_figure(file_name):
+    plt.tight_layout()
+    plt.savefig(file_name)
+    plt.close()
+
+    if os.path.exists(file_name):
+        size = os.path.getsize(file_name)
+        if size > 0:
+            print(f"✅ File '{file_name}' saved ({size} bytes).")
+        else:
+            print(f"⚠️ File '{file_name}' created but empty.")
+    else:
+        print(f"❌ Failed to save '{file_name}'.")
+
+
+def plot_roce_summary(results, x_axis, fixed_params):
+    """
+    Plot and save the 4 RoCE summary graphs.
+
+    Parameters
+    ----------
+    results : dict
+        results[scheme][x_value] -> metrics dict
+    x_axis : str
+        "k", "qps", or "trials"
+    fixed_params : dict
+        Contains the fixed parameters for naming:
+        e.g. {"k":8, "qps":8, "trials":20}
+    """
+
+    schemes = ["ecmp", "eecmp", "flowlet"]
+    scheme_labels = {
+        "ecmp": "ECMP",
+        "eecmp": "e-ECMP",
+        "flowlet": "Flowlet-e-ECMP"
+    }
+
+    x_values = sorted(results["ecmp"].keys())
+
+    # String for filenames describing fixed params
+    fixed_str = "_".join([f"{k}={v}" for k, v in fixed_params.items()])
+
+    # ============================================================
+    # 1) p99 link load
+    # ============================================================
+
+    p99_data = _extract_metric(results, schemes, x_values, "p99")
+
+    plt.figure()
+    for scheme in schemes:
+        plt.plot(x_values, p99_data[scheme], marker='o', label=scheme_labels[scheme])
+
+    plt.xlabel(x_axis)
+    plt.ylabel("p99(link load)")
+    plt.title("Tail Link Load (p99)")
+    plt.grid(True)
+    plt.legend()
+
+    file_name = f"roce_p99_vs_{x_axis}_{fixed_str}.png"
+    _save_figure(file_name)
+
+    # ============================================================
+    # 2) CV
+    # ============================================================
+
+    cv_data = _extract_metric(results, schemes, x_values, "cv")
+
+    plt.figure()
+    for scheme in schemes:
+        plt.plot(x_values, cv_data[scheme], marker='o', label=scheme_labels[scheme])
+
+    plt.xlabel(x_axis)
+    plt.ylabel("CV (std/mean)")
+    plt.title("Load Balance (Coefficient of Variation)")
+    plt.grid(True)
+    plt.legend()
+
+    file_name = f"roce_cv_vs_{x_axis}_{fixed_str}.png"
+    _save_figure(file_name)
+'''
+    # ============================================================
+    # 3) Utilization Fraction
+    # ============================================================
+
+    util_data = _extract_metric(results, schemes, x_values, "util_frac")
+
+    plt.figure()
+    for scheme in schemes:
+        plt.plot(x_values, util_data[scheme], marker='o', label=scheme_labels[scheme])
+
+    plt.xlabel(x_axis)
+    plt.ylabel("Fraction of links used")
+    plt.title("Link Utilization Fraction")
+    plt.grid(True)
+    plt.legend()
+
+    file_name = f"roce_util_vs_{x_axis}_{fixed_str}.png"
+    _save_figure(file_name)
+
+    # ============================================================
+    # 4) Core–Aggregation p99
+    # ============================================================
+
+    core_data = _extract_metric(results, schemes, x_values,
+                                metric_name="p99",
+                                layer="core-agg")
+
+    plt.figure()
+    for scheme in schemes:
+        plt.plot(x_values, core_data[scheme], marker='o', label=scheme_labels[scheme])
+
+    plt.xlabel(x_axis)
+    plt.ylabel("p99(core–agg load)")
+    plt.title("Core–Aggregation Tail Load")
+    plt.grid(True)
+    plt.legend()
+
+    file_name = f"roce_coreAgg_p99_vs_{x_axis}_{fixed_str}.png"
+    _save_figure(file_name)
+'''
+
+
+def parse_sweep_list(s):
+    if s is None or s == "":
+        return None
+    try:
+        return [int(x) for x in s.split(",")]
+    except:
+        raise ValueError("Sweep values must be comma-separated integers")
+
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Random test: Avg shortest path vs. link failure prob.")
-    parser.add_argument("-k", "--k", type=int, required=True,
-                        help="Fat-tree parameter k (positive even integer).")
-    parser.add_argument("-p", "--prob", type=float, default=0.0,
-                        help="Single failure probability in [0,1] (default: 0).")
+    parser = argparse.ArgumentParser(
+        description="Fat-tree experiments: resilience, ECMP, and RoCE flowlet analysis"
+    )
+
+    # ------------------------------------------------------------
+    # Experiment selector
+    # ------------------------------------------------------------
+    parser.add_argument("--experiment",
+                        choices=["fat_tree", "ecmp", "roce"],
+                        required=True,
+                        help="Which experiment to run")
+
+    # ------------------------------------------------------------
+    # Common optional parameters
+    # ------------------------------------------------------------
+    parser.add_argument("--num_flows", type=int, default=2000,
+                        help="Number of flows (default=2000)")
+
+    parser.add_argument("--flow_load", type=float, default=1.0,
+                        help="Total load per flow (default=1.0)")
+
+    parser.add_argument("--qps", type=int, default=1,
+                        help="Number of QPs per flow (default=1)")
+
+    parser.add_argument("--trials", type=int, default=1,
+                        help="Number of trials / flowlet timesteps (default=1)")
+
+    parser.add_argument("--seed", type=int, default=0,
+                        help="Random seed")
+
+    # ------------------------------------------------------------
+    # Parameters for fat-tree resilience experiment
+    # ------------------------------------------------------------
+    parser.add_argument("-k", type=int,
+                        help="Fat-tree k (required unless k_sweep is used in RoCE)")
+
+    parser.add_argument("--prob", type=float, default=0.0,
+                        help="Failure probability (fat_tree experiment only)")
+
     parser.add_argument("--sweep", type=str, default="",
-                        help='Comma-separated probs to sweep, e.g. "0,0.01,0.02,0.05" (overrides -p).')
-    parser.add_argument("-t", "--trials", type=int, default=10,
-                        help="Number of averaging trials per probability value (default=10).")
-    parser.add_argument("--ecmp", type=int, choices=[0, 1], default=0,
-                        help="If 1, run ECMP experiment (only uses -k); if 0 or omitted, run original experiments")
+                        help="Comma-separated probability sweep (fat_tree only)")
+
+    # ------------------------------------------------------------
+    # Sweep parameters for RoCE experiment
+    # ------------------------------------------------------------
+    parser.add_argument("--k_sweep", type=str, default="",
+                        help="Comma-separated k values for RoCE sweep")
+
+    parser.add_argument("--qps_sweep", type=str, default="",
+                        help="Comma-separated QPs values for RoCE sweep")
+
+    parser.add_argument("--trials_sweep", type=str, default="",
+                        help="Comma-separated trials values for RoCE sweep")
+
     args = parser.parse_args()
 
-    k = args.k
-    if k <= 0 or k % 2 != 0:
-        print("Error: k must be a positive even integer.", file=sys.stderr)
-        sys.exit(1)
+    # ------------------------------------------------------------
+    # Set random seed
+    # ------------------------------------------------------------
+    np.random.seed(args.seed)
+    random.seed(args.seed)
 
-    trials = args.trials
-    if trials < 1:
-        print("Error: --trials must be an integer >= 1.", file=sys.stderr)
-        sys.exit(1)
+    # ============================================================
+    # 1) FAT-TREE RESILIENCE EXPERIMENT
+    # ============================================================
 
-    g = build_fat_tree(k)
-    draw_graph(g, k, p=0)
+    if args.experiment == "fat_tree":
 
-    if args.ecmp == 1:
-        run_ecmp_experiment(g, num_flows=2000, scenario="A")
-        run_ecmp_experiment(g, num_flows=2000, scenario="B")
-        exit(0)
-
-    if args.sweep:
-        try:
-            prob_values = [float(x) for x in args.sweep.split(",")]
-        except ValueError:
-            print("Error: --sweep must be comma-separated floats.", file=sys.stderr)
+        if args.k is None:
+            print("Error: -k is required for fat_tree experiment")
             sys.exit(1)
-        if not all(0.0 <= x <= 1.0 for x in prob_values):
-            print("Error: all sweep probabilities must be in [0,1].", file=sys.stderr)
+
+        k = args.k
+        if k <= 0 or k % 2 != 0:
+            print("Error: k must be positive even integer")
             sys.exit(1)
-        run_random_test_and_plot(k, prob_values, trials)
-    else:
-        prob = args.prob
-        if not (0.0 <= prob <= 1.0):
-            print("Error: prob must be in [0,1].", file=sys.stderr)
+
+        g = build_fat_tree(k)
+        draw_graph(g, k, p=0)
+
+        if args.sweep:
+            try:
+                prob_values = [float(x) for x in args.sweep.split(",")]
+            except:
+                print("Error: sweep must be comma-separated floats")
+                sys.exit(1)
+        else:
+            prob_values = [args.prob]
+
+        run_random_test_and_plot(k, prob_values, args.trials)
+
+    # ============================================================
+    # 2) ECMP / e-ECMP CLASSIC EXPERIMENT
+    # ============================================================
+
+    elif args.experiment == "ecmp":
+
+        if args.k is None:
+            print("Error: -k is required for ecmp experiment")
             sys.exit(1)
-        run_random_test_and_plot(k, [prob], trials)
-        
+
+        k = args.k
+        if k <= 0 or k % 2 != 0:
+            print("Error: k must be a positive even integer")
+            sys.exit(1)
+
+        g = build_fat_tree(k)
+
+        # Classic ECMP experiment: scenario A + B
+        run_ecmp_experiment(g, num_flows=args.num_flows, scenario="A")
+        run_ecmp_experiment(g, num_flows=args.num_flows, scenario="B")
+
+    # ============================================================
+    # 3) RoCE FLOWLET EXPERIMENT WITH SWEEPS
+    # ============================================================
+
+    elif args.experiment == "roce":
+
+        # Parse sweep lists
+        k_sweep_vals = parse_sweep_list(args.k_sweep)
+        qps_sweep_vals = parse_sweep_list(args.qps_sweep)
+        trials_sweep_vals = parse_sweep_list(args.trials_sweep)
+
+        # If no sweep provided → single default point
+        if k_sweep_vals is None and qps_sweep_vals is None and trials_sweep_vals is None:
+
+            if args.k is None:
+                print("Error: must supply -k if no k_sweep is given")
+                sys.exit(1)
+
+            results = run_roce_sweep_summary(
+                x_axis="qps",
+                sweep_values=[args.qps],
+                k_fixed=args.k,
+                qps_fixed=args.qps,
+                trials_fixed=args.trials,
+                num_flows=args.num_flows,
+                flow_load=args.flow_load,
+                seed=args.seed
+            )
+
+            fixed_params = {"k": args.k, "trials": args.trials}
+            plot_roce_summary(results, x_axis="qps", fixed_params=fixed_params)
+            sys.exit(0)
+
+        # --------------------------------------------------------
+        # Run k sweep
+        # --------------------------------------------------------
+        if k_sweep_vals is not None:
+            results = run_roce_sweep_summary(
+                x_axis="k",
+                sweep_values=k_sweep_vals,
+                k_fixed=None,
+                qps_fixed=args.qps,
+                trials_fixed=args.trials,
+                num_flows=args.num_flows,
+                flow_load=args.flow_load,
+                seed=args.seed
+            )
+
+            fixed_params = {"qps": args.qps, "trials": args.trials}
+            plot_roce_summary(results, x_axis="k", fixed_params=fixed_params)
+
+        # --------------------------------------------------------
+        # Run qps sweep
+        # --------------------------------------------------------
+        if qps_sweep_vals is not None:
+
+            if args.k is None:
+                print("Error: must supply -k when sweeping qps")
+                sys.exit(1)
+
+            results = run_roce_sweep_summary(
+                x_axis="qps",
+                sweep_values=qps_sweep_vals,
+                k_fixed=args.k,
+                qps_fixed=None,
+                trials_fixed=args.trials,
+                num_flows=args.num_flows,
+                flow_load=args.flow_load,
+                seed=args.seed
+            )
+
+            fixed_params = {"k": args.k, "trials": args.trials}
+            plot_roce_summary(results, x_axis="qps", fixed_params=fixed_params)
+
+        # --------------------------------------------------------
+        # Run trials sweep
+        # --------------------------------------------------------
+        if trials_sweep_vals is not None:
+
+            if args.k is None:
+                print("Error: must supply -k when sweeping trials")
+                sys.exit(1)
+
+            results = run_roce_sweep_summary(
+                x_axis="trials",
+                sweep_values=trials_sweep_vals,
+                k_fixed=args.k,
+                qps_fixed=args.qps,
+                trials_fixed=None,
+                num_flows=args.num_flows,
+                flow_load=args.flow_load,
+                seed=args.seed
+            )
+
+            fixed_params = {"k": args.k, "qps": args.qps}
+            plot_roce_summary(results, x_axis="trials", fixed_params=fixed_params)
