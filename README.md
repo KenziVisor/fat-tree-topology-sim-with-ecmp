@@ -18,7 +18,7 @@ Clone and set up the environment:
     cd fat-tree-topology-sim-with-ecmp
     python3 -m venv .venv
     source .venv/bin/activate
-    pip install networkx matplotlib numpy
+    python3 -m pip install -r requirements.txt
 
 ---
 
