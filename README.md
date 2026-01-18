@@ -294,56 +294,86 @@ The imbalance is caused purely by **hash collisions**, not by insufficient netwo
 | `ecmp load visualization k=X scenario=B.png` | ECMP load visualization (pod-to-pod traffic) |
 
 ---
-## Experiment 3: RoCE Routing – ECMP, e-ECMP, and Flowlet-e-ECMP
+## Experiment 3: RoCE Routing — ECMP, e-ECMP, Flowlet-only and Flowlet-e-ECMP
 
 ### Motivation
 
-Modern AI training clusters employ RDMA over Ethernet and rely on multi-path routing. 
-Recent systems extend ECMP by splitting flows across multiple Queue Pairs (e-ECMP) and further reshuffling paths over time using flowlets. 
-This experiment isolates and evaluates the **routing-level behavior** of these mechanisms.
+Modern AI training clusters employ RDMA over Ethernet (RoCE) and rely heavily on multipath routing.
+Recent production systems extend ECMP by splitting flows across multiple Queue Pairs (e-ECMP) and by periodically reshuffling paths using flowlets.
+This experiment isolates and evaluates the **routing-level behavior** of these mechanisms in a controlled fat-tree topology.
+
+Unlike packet-level simulators, this model focuses purely on hashing-based routing decisions, allowing direct measurement of load distribution effects.
 
 ---
 
 ### Routing Models
 
-**ECMP:**  
+**ECMP:**
 Each flow is hashed once to a single equal-cost path.
 
-**e-ECMP:**  
-Each flow is split into multiple QPs, each hashed independently.
+**Flowlet-only:**
+Each flow is periodically re-hashed across equal-cost paths at discrete flowlet time epochs, introducing temporal path diversity without spatial splitting.
 
-**Flowlet-based e-ECMP:**  
-Each QP is periodically re-hashed across equal-cost paths at discrete flowlet intervals, enabling temporal path diversity while preserving in-order delivery within each flowlet.
+**e-ECMP:**
+Each flow is split into multiple Queue Pairs (QPs), each hashed independently, introducing spatial path diversity.
+
+**Flowlet-based e-ECMP:**
+Each QP is periodically re-hashed across equal-cost paths at discrete flowlet intervals, combining spatial and temporal multipath diversity.
+
+All schemes inject identical total traffic volume via load normalization.
 
 ---
 
 ### Traffic Model
 
-- Uniform random host-to-host flows
-- Equal normalized load per flow
-- No queuing or transport modeling — routing effects only
+* Uniform random host-to-host flows
+* Equal normalized load per flow
+* No queuing or transport modeling
+* Routing effects isolated at flow and flowlet granularity
 
 ---
 
 ### Evaluation Metrics
 
-From per-link simulated loads:
+Per-link simulated loads are collected and summarized using:
 
-- **p99 link load** – congestion hotspot severity  
-- **CV (std/mean)** – global load balance fairness
+* **Coefficient of Variation (CV = std/mean)** — global load balance fairness
+* **Tail link load (p90)** — congestion hotspot severity
+* **Link utilization fraction** — fraction of links carrying nonzero load
+* **Empirical CDF of link loads** — full distribution shape
+
+---
+
+### Parameter Sweeps
+
+Three reproducible sweeps are supported.
+
+**QPs Sweep (spatial multipath effect)**
+
+python3 fat-tree-topology-sim.py --experiment roce -k 8 --num_flows 2000 --qps_sweep 1,2,4,8,16 --trials 30
+
+**Flowlet Sweep (temporal multipath effect)**
+
+python3 fat-tree-topology-sim.py --experiment roce -k 8 --num_flows 2000 --qps 8 --trials_sweep 1,2,5,10,20,40
+
+**Topology Sweep (scaling effect)**
+
+python3 fat-tree-topology-sim.py --experiment roce --k_sweep 4,8,16,32 --num_flows 2000 --qps 8 --trials 20
 
 ---
 
 ### Output Visualization
 
-For each parameter sweep (topology size k, QPs per flow, or number of flowlets), two graphs are produced:
+For each sweep, the simulator produces comparative plots for:
 
-- **p99(link load) vs sweep parameter**  
-- **CV(load) vs sweep parameter**
+* CV(load) vs sweep parameter
+* Link utilization vs sweep parameter (topology sweep)
+* Tail link load p90 vs sweep parameter
+* Empirical CDF of link loads (representative topology)
 
-Each graph compares three routing schemes:
+Each plot compares:
 
-**ECMP**, **e-ECMP**, and **Flowlet-e-ECMP**
+ECMP, Flowlet-only, e-ECMP, and Flowlet-e-ECMP
 
 ---
 
@@ -351,14 +381,28 @@ Each graph compares three routing schemes:
 
 Example filenames:
 
-- **roce_p99_vs_qps_k=8_trials=20.png**
-- **roce_cv_vs_qps_k=8_trials=20.png**
-- **roce_p99_vs_trials_k=8_qps=8.png**
-- **roce_cv_vs_k_qps=8_trials=20.png**
+roce_cv_vs_qps_k=8_trials=30.png
+roce_p90_vs_qps_k=8_trials=30.png
 
-These plots are directly used for analysis in the final report.
+roce_cv_vs_trials_k=8_qps=8.png
+roce_p90_vs_trials_k=8_qps=8.png
+
+roce_cv_vs_k_qps=8_trials=20.png
+roce_util_vs_k_qps=8_trials=20.png
+roce_p90_vs_k_qps=8_trials=20.png
+
+roce_cdf_k=8.png
+
+These plots are directly used for the analysis in the final report.
 
 ---
+
+### Key Insight
+
+Static ECMP suffers from persistent hash collisions that create congestion hotspots even in non-blocking fat-tree networks.
+Spatial multipath (e-ECMP) significantly improves load balance.
+Temporal multipath (flowlets) further mitigates persistent imbalance.
+Combining both yields the most uniform utilization and lowest congestion.
 
 ## Summary
 

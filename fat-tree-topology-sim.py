@@ -7,6 +7,11 @@ import os
 import matplotlib.colors as mcolors
 from matplotlib import pyplot as plt
 from typing import List, Tuple
+import hashlib
+
+
+def stable_hash(x):
+    return int(hashlib.md5(str(x).encode()).hexdigest(), 16)
 
 
 def build_fat_tree(k: int) -> nx.Graph:
@@ -365,10 +370,10 @@ def hash_and_route(flows, path_map, flow_load=1, qps_num=1, timestamp=0):
 
             # deterministic ECMP hash
             # timestamp added to enable flowlet-based reshuffling
-            h = (hash(src) * 1315423911 +
-                 hash(dst) * 2654435761 +
-                 hash(qp_id) * 97531 +
-                 hash(timestamp) * 19260817) % num_paths
+            h = (stable_hash(src) * 1315423911 +
+                 stable_hash(dst) * 2654435761 +
+                 stable_hash(qp_id) * 97531 +
+                 stable_hash(timestamp) * 19260817) % num_paths
 
             chosen_path = paths[h]
 
@@ -426,6 +431,16 @@ def node_type(n):
     return "host"
 
 
+def compute_link_load_cdf(loads):
+    """
+    Returns sorted load values and their empirical CDF.
+    """
+    vals = np.array(list(loads.values()))
+    vals_sorted = np.sort(vals)
+    cdf = np.arange(1, len(vals_sorted)+1) / len(vals_sorted)
+    return vals_sorted, cdf
+
+
 def compute_usage_metrics(g, loads):
     """
     Compute link-usage metrics for ECMP / e-ECMP / Flowlet-e-ECMP experiments.
@@ -456,8 +471,12 @@ def compute_usage_metrics(g, loads):
     std = load_values.std()
     cv = std / mean if mean > 0 else 0.0
 
-    p99 = np.percentile(load_values, 99)
+    p99 = np.percentile(load_values, 90)
     util_frac = np.count_nonzero(load_values > 0) / len(load_values)
+
+    # --- CDF computation ---
+    vals_sorted = np.sort(load_values)
+    cdf = np.arange(1, len(vals_sorted) + 1) / len(vals_sorted)
 
     # ---- classify edges by fat-tree layer ----
     # Node naming convention in your code:
@@ -494,7 +513,9 @@ def compute_usage_metrics(g, loads):
         "p99": float(p99),
         "cv": float(cv),
         "util_frac": float(util_frac),
-        "layer_p99": layer_p99
+        "layer_p99": layer_p99,
+        "cdf_x": vals_sorted,
+        "cdf_y": cdf
     }
 
     return metrics
@@ -640,6 +661,8 @@ def run_flowlet_roce_experiment(g: nx.Graph, num_flows=2000, scenario="A",
         scenario_title = "ECMP"
     elif qps_num > 1 and trials == 1:
         scenario_title = "E-ECMP"
+    elif qps_num == 1 and trials > 1:
+        scenario_title = "FLOWLET"
     else:
         scenario_title = "FLOWLET E-ECMP"
     draw_ecmp_graph(g, k, total_loads, scenario=scenario_title, stats=stats)
@@ -654,31 +677,6 @@ def run_roce_sweep_summary(x_axis, sweep_values,
                            num_flows,
                            flow_load,
                            seed=0):
-    """
-    Run RoCE sweep experiment and collect usage metrics.
-
-    Parameters
-    ----------
-    x_axis : str
-        Which parameter to sweep: "k", "qps", or "trials"
-    sweep_values : list
-        Values for the sweep axis
-    k_fixed : int
-        k value when not sweeping over k
-    qps_fixed : int
-        qps value when not sweeping over qps
-    trials_fixed : int
-        trials value when not sweeping over trials
-    num_flows : int
-    flow_load : float
-    seed : int
-
-    Returns
-    -------
-    results : dict
-        results[scheme][x_value] -> metrics dict
-        scheme ∈ {"ecmp", "eecmp", "flowlet"}
-    """
 
     np.random.seed(seed)
     random.seed(seed)
@@ -686,9 +684,24 @@ def run_roce_sweep_summary(x_axis, sweep_values,
     results = {
         "ecmp": {},
         "eecmp": {},
-        "flowlet": {}
+        "flowlet": {},
+        "flowlet_eecmp": {}
     }
 
+    # =========================================================
+    # Build topology + flows ONCE if not sweeping over k
+    # =========================================================
+    if x_axis != "k":
+        k = k_fixed
+        g = build_fat_tree(k)
+
+        state = extract_topology_info(g)
+        flows = generate_flows(state, num_flows, scenario="A")
+        path_map = compute_all_ecmp_paths(g, flows)
+
+    # =========================================================
+    # Sweep loop
+    # =========================================================
     for x in sweep_values:
         print(f"\n===== RoCE sweep: {x_axis} = {x} =====")
 
@@ -697,24 +710,25 @@ def run_roce_sweep_summary(x_axis, sweep_values,
             k = x
             qps = qps_fixed
             trials = trials_fixed
+
+            # build topology + flows fresh for each k
+            g = build_fat_tree(k)
+            state = extract_topology_info(g)
+            flows = generate_flows(state, num_flows, scenario="A")
+            path_map = compute_all_ecmp_paths(g, flows)
+
         elif x_axis == "qps":
             k = k_fixed
             qps = x
             trials = trials_fixed
+
         elif x_axis == "trials":
             k = k_fixed
             qps = qps_fixed
             trials = x
+
         else:
             raise ValueError("x_axis must be 'k', 'qps', or 'trials'")
-
-        # --- build topology ---
-        g = build_fat_tree(k)
-
-        # --- prepare flows and ECMP path map once ---
-        state = extract_topology_info(g)
-        flows = generate_flows(state, num_flows, scenario="A")
-        path_map = compute_all_ecmp_paths(g, flows)
 
         # =========================================================
         # 1) ECMP baseline  (1 QP, 1 trial)
@@ -728,7 +742,24 @@ def run_roce_sweep_summary(x_axis, sweep_values,
         results["ecmp"][x] = metrics_ecmp
 
         # =========================================================
-        # 2) e-ECMP  (multi-QP, single trial)
+        # 2) FLOWLET-only  (1 QP, multi-trial)
+        # =========================================================
+        total_flowlet_only_loads = {}
+        per_timestep_load = flow_load / trials
+
+        for t in range(trials):
+            loads = hash_and_route(flows, path_map,
+                                    flow_load=per_timestep_load,
+                                    qps_num=1,
+                                    timestamp=t)
+            for link, val in loads.items():
+                total_flowlet_only_loads[link] = total_flowlet_only_loads.get(link, 0) + val
+
+        metrics_flowlet_only = compute_usage_metrics(g, total_flowlet_only_loads)
+        results["flowlet"][x] = metrics_flowlet_only
+
+        # =========================================================
+        # 3) e-ECMP  (multi-QP, single trial)
         # =========================================================
         loads_eecmp = hash_and_route(flows, path_map,
                                      flow_load=flow_load,
@@ -739,11 +770,9 @@ def run_roce_sweep_summary(x_axis, sweep_values,
         results["eecmp"][x] = metrics_eecmp
 
         # =========================================================
-        # 3) Flowlet-e-ECMP  (multi-QP, multi-trial)
+        # 4) Flowlet-e-ECMP  (multi-QP, multi-trial)
         # =========================================================
-
         total_loads_flowlet = {}
-
         per_timestep_load = flow_load / trials
 
         for t in range(trials):
@@ -756,7 +785,7 @@ def run_roce_sweep_summary(x_axis, sweep_values,
                 total_loads_flowlet[link] = total_loads_flowlet.get(link, 0) + val
 
         metrics_flowlet = compute_usage_metrics(g, total_loads_flowlet)
-        results["flowlet"][x] = metrics_flowlet
+        results["flowlet_eecmp"][x] = metrics_flowlet
 
     return results
 
@@ -805,11 +834,20 @@ def plot_roce_summary(results, x_axis, fixed_params):
         e.g. {"k":8, "qps":8, "trials":20}
     """
 
-    schemes = ["ecmp", "eecmp", "flowlet"]
+    schemes = ["ecmp", "flowlet", "eecmp", "flowlet_eecmp"]
+
     scheme_labels = {
         "ecmp": "ECMP",
+        "flowlet": "Flowlet-only",
         "eecmp": "e-ECMP",
-        "flowlet": "Flowlet-e-ECMP"
+        "flowlet_eecmp": "Flowlet-e-ECMP"
+    }
+
+    scheme_markers = {
+        "ecmp": "o",  # circle
+        "flowlet": "s",  # square
+        "eecmp": "^",  # triangle up
+        "flowlet_eecmp": "D"  # diamond
     }
 
     x_values = sorted(results["ecmp"].keys())
@@ -825,15 +863,16 @@ def plot_roce_summary(results, x_axis, fixed_params):
 
     plt.figure()
     for scheme in schemes:
-        plt.plot(x_values, p99_data[scheme], marker='o', label=scheme_labels[scheme])
+        plt.plot(x_values, p99_data[scheme], marker=scheme_markers[scheme], label=scheme_labels[scheme], markersize=7,
+         linewidth=2)
 
     plt.xlabel(x_axis)
-    plt.ylabel("p99(link load)")
-    plt.title("Tail Link Load (p99)")
+    plt.ylabel("p90(link load)")
+    plt.title("Tail Link Load (p90)")
     plt.grid(True)
     plt.legend()
 
-    file_name = f"roce_p99_vs_{x_axis}_{fixed_str}.png"
+    file_name = f"roce_p90_vs_{x_axis}_{fixed_str}.png"
     _save_figure(file_name)
 
     # ============================================================
@@ -844,7 +883,8 @@ def plot_roce_summary(results, x_axis, fixed_params):
 
     plt.figure()
     for scheme in schemes:
-        plt.plot(x_values, cv_data[scheme], marker='o', label=scheme_labels[scheme])
+        plt.plot(x_values, cv_data[scheme], marker=scheme_markers[scheme], label=scheme_labels[scheme], markersize=7,
+                 linewidth=2)
 
     plt.xlabel(x_axis)
     plt.ylabel("CV (std/mean)")
@@ -854,16 +894,46 @@ def plot_roce_summary(results, x_axis, fixed_params):
 
     file_name = f"roce_cv_vs_{x_axis}_{fixed_str}.png"
     _save_figure(file_name)
-'''
+
     # ============================================================
-    # 3) Utilization Fraction
+    # 3) CDF
+    # ============================================================
+
+    # choose representative sweep point (middle of sweep)
+    mid_x = x_values[len(x_values) // 2]
+
+    plt.figure(figsize=(7, 5))
+
+    for scheme in schemes:
+        cdf_x = results[scheme][mid_x]["cdf_x"]
+        cdf_y = results[scheme][mid_x]["cdf_y"]
+
+        plt.plot(cdf_x, cdf_y,
+                 marker=scheme_markers[scheme],
+                 markevery=max(len(cdf_x) // 20, 1),
+                 linewidth=2,
+                 label=scheme_labels[scheme])
+
+    plt.xlabel("Link Load")
+    plt.ylabel("CDF")
+    plt.title(f"Link Load CDF ({x_axis}={mid_x})")
+    plt.grid(True)
+    plt.legend()
+
+    # --- Save ---
+    file_name = f"roce_cdf_{x_axis}={mid_x}.png"
+    _save_figure(file_name)
+
+    # ============================================================
+    # 4) Utilization Fraction
     # ============================================================
 
     util_data = _extract_metric(results, schemes, x_values, "util_frac")
 
     plt.figure()
     for scheme in schemes:
-        plt.plot(x_values, util_data[scheme], marker='o', label=scheme_labels[scheme])
+        plt.plot(x_values, util_data[scheme], marker=scheme_markers[scheme], label=scheme_labels[scheme], markersize=7,
+         linewidth=2)
 
     plt.xlabel(x_axis)
     plt.ylabel("Fraction of links used")
@@ -873,9 +943,9 @@ def plot_roce_summary(results, x_axis, fixed_params):
 
     file_name = f"roce_util_vs_{x_axis}_{fixed_str}.png"
     _save_figure(file_name)
-
+    '''
     # ============================================================
-    # 4) Core–Aggregation p99
+    # 5) Core–Aggregation p99
     # ============================================================
 
     core_data = _extract_metric(results, schemes, x_values,
@@ -884,7 +954,8 @@ def plot_roce_summary(results, x_axis, fixed_params):
 
     plt.figure()
     for scheme in schemes:
-        plt.plot(x_values, core_data[scheme], marker='o', label=scheme_labels[scheme])
+        plt.plot(x_values, core_data[scheme], marker=scheme_markers[scheme], label=scheme_labels[scheme], markersize=7,
+         linewidth=2)
 
     plt.xlabel(x_axis)
     plt.ylabel("p99(core–agg load)")
@@ -894,7 +965,7 @@ def plot_roce_summary(results, x_axis, fixed_params):
 
     file_name = f"roce_coreAgg_p99_vs_{x_axis}_{fixed_str}.png"
     _save_figure(file_name)
-'''
+    '''
 
 
 def parse_sweep_list(s):
