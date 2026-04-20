@@ -1,9 +1,9 @@
-# Fat-Tree Routing Simulation: ECMP, e-ECMP, and Flowlet-Based Load Balancing
+# Fat-Tree RDMA Routing Simulation: ECMP, e-ECMP, and Flowlet-Based Load Balancing
 
-This project implements a Python-based simulator for studying routing behavior in fat-tree data center networks. 
+This project implements a Python-based simulator for studying routing behavior in RDMA fat-tree data center networks. 
 The simulator focuses on multipath routing mechanisms used in modern large-scale clusters, including Equal-Cost Multi-Path (ECMP), enhanced ECMP using multiple Queue Pairs (e-ECMP), and flowlet-based path reshuffling.
 
-Rather than modeling packet-level transport or queuing, the simulator isolates routing decisions at the flow and flowlet level. 
+Rather than modeling packet-level, transport or queuing, the simulator isolates routing decisions at the flow and flowlet level. 
 This allows direct examination of how different hashing-based routing schemes distribute traffic load across network links and mitigate congestion hotspots.
 
 The framework supports reproducible parameter sweeps over topology size, traffic load, number of QPs, and flowlet intervals, producing quantitative comparisons of routing efficiency and load balance.
